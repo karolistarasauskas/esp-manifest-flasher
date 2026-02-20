@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>DotBot ZIP Flasher</title>
+  <style>
+    :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+    body { margin: 20px; max-width: 980px; }
+    .row { display:flex; gap:12px; flex-wrap: wrap; align-items: center; }
+    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ccc; background: #fff; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    input[type=file], label { padding: 8px 0; }
+    .card { border: 1px solid #e5e5e5; border-radius: 14px; padding: 14px; margin-top: 12px; }
+    pre { background:#0b0b0b; color:#e8e8e8; padding: 12px; border-radius: 12px; overflow:auto; max-height: 380px; }
+    .progress { height: 10px; background:#eee; border-radius: 999px; overflow:hidden; }
+    .bar { height: 100%; width: 0%; background:#111; transition: width 120ms linear; }
+    .muted { color:#666; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .ok { color: #2aa84a; }
+    .warn { color: #e6b400; }
+    .bad { color: #ff4d4d; }
+  </style>
+</head>
+<body>
+  <h1>ZIP Flasher</h1>
+  <p class="muted">
+    Choose a ZIP update file. Connect and Flash.
+    (Chrome/Edge only)
+  </p>
+
+  <div class="card">
+    <div class="row">
+      <label>
+        Firmware ZIP:
+        <input id="zipInput" type="file" accept=".zip" />
+      </label>
+
+      <label>
+        <input id="verifyHashes" type="checkbox" checked />
+        Verify SHA-256 from manifest (recommended)
+      </label>
+
+      <button id="connectBtn" disabled>Connect</button>
+      <button id="flashBtn" disabled>Flash</button>
+      <button id="disconnectBtn" disabled>Disconnect</button>
+    </div>
+
+    <div style="margin-top:12px">
+      <div class="progress"><div class="bar" id="bar"></div></div>
+      <div class="row" style="justify-content: space-between; margin-top:8px">
+        <div id="status" class="muted">No ZIP loaded.</div>
+        <div id="meta" class="muted"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button id="clearLogBtn">Clear log</button>
+    </div>
+    <pre id="log"></pre>
+  </div>
+
+  <!-- Dependencies -->
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+
+  <script type="module">
+    // Use the bundled ESM entry for esptool-js (includes dependencies like pako)
+    import { ESPLoader, Transport } from "https://esm.sh/esptool-js@0.5.5?bundle";
+    console.log("esptool-js loaded", { ESPLoader: typeof ESPLoader, Transport: typeof Transport });
+    // Basic diagnostics so failures aren't silent.
+    window.addEventListener("error", (e) => {
+      try { console.error(e.error || e.message || e); } catch {}
+      const msg = e?.error?.message || e?.message || String(e);
+      const logEl = document.getElementById("log");
+      if (logEl) {
+        logEl.textContent += `JS ERROR: ${msg}\n`;
+      }
+    });
+    window.addEventListener("unhandledrejection", (e) => {
+      try { console.error(e.reason); } catch {}
+      const msg = e?.reason?.message || String(e?.reason);
+      const logEl = document.getElementById("log");
+      if (logEl) {
+        logEl.textContent += `PROMISE REJECTION: ${msg}\n`;
+      }
+    });
+    // ---------- UI helpers ----------
+    const $ = (id) => document.getElementById(id);
+    const logEl = $("log");
+    const statusEl = $("status");
+    const metaEl = $("meta");
+    const barEl = $("bar");
+
+    function log(msg) {
+      logEl.textContent += msg + "\n";
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    function setStatus(msg) { statusEl.textContent = msg; }
+    function setMeta(msg) { metaEl.textContent = msg; }
+    function setProgress01(p) { barEl.style.width = `${Math.max(0, Math.min(1, p)) * 100}%`; }
+
+    $("clearLogBtn").addEventListener("click", () => { logEl.textContent = ""; });
+
+    // ---------- State ----------
+    let zipObj = null;                 // JSZip instance
+    let manifest = null;               // parsed manifest.json
+    let filesCache = new Map();        // path -> Uint8Array
+
+    let port = null;
+    let transport = null;
+    let loader = null;
+
+    // ---------- Manifest helpers ----------
+    function parseOffset(v) {
+      if (typeof v === "number") return v;
+      if (typeof v !== "string") throw new Error("Invalid offset type");
+      const s = v.trim().toLowerCase();
+      if (s.startsWith("0x")) return parseInt(s, 16);
+      return parseInt(s, 10);
+    }
+
+    function normalizeTarget(t) {
+      // your manifest uses "esp32s3" etc
+      const s = String(t || "").toLowerCase().trim();
+      // map to esptool-js chipFamily-ish strings (it mostly uses detection anyway)
+      if (s === "esp32s3") return "ESP32-S3";
+      if (s === "esp32s2") return "ESP32-S2";
+      if (s === "esp32c3") return "ESP32-C3";
+      if (s === "esp32c6") return "ESP32-C6";
+      if (s === "esp32")   return "ESP32";
+      return s.toUpperCase();
+    }
+
+    function validateManifest(m) {
+      if (!m || typeof m !== "object") throw new Error("manifest.json is not an object");
+      if (m.format !== 1) throw new Error(`Unsupported manifest format: ${m.format}`);
+      if (!m.target) throw new Error("manifest.json: missing target");
+      if (!Array.isArray(m.files) || m.files.length === 0) throw new Error("manifest.json: files[] missing/empty");
+
+      for (const f of m.files) {
+        if (!f.path) throw new Error("manifest.json: file missing path");
+        if (f.offset === undefined) throw new Error("manifest.json: file missing offset");
+        parseOffset(f.offset);
+        if (f.size !== undefined && typeof f.size !== "number") throw new Error("manifest.json: file size must be number");
+        if (f.sha256 !== undefined && typeof f.sha256 !== "string") throw new Error("manifest.json: sha256 must be string");
+      }
+    }
+
+    async function readZipFileAsUint8(path) {
+      if (filesCache.has(path)) return filesCache.get(path);
+      const f = zipObj.file(path);
+      if (!f) throw new Error(`ZIP missing file: ${path}`);
+      const ab = await f.async("arraybuffer");
+      const u8 = new Uint8Array(ab);
+      filesCache.set(path, u8);
+      return u8;
+    }
+
+    async function sha256Hex(u8) {
+      // Browser crypto API
+      const digest = await crypto.subtle.digest("SHA-256", u8);
+      const bytes = new Uint8Array(digest);
+      return [...bytes].map(b => b.toString(16).padStart(2, "0")).join("");
+    }
+
+    function u8ToBinaryString(u8) {
+      // esptool-js (in some bundled builds) expects "binary string" data and will call charCodeAt.
+      // Convert Uint8Array -> binary string in chunks to avoid call stack limits.
+      const chunk = 0x8000;
+      let out = "";
+      for (let i = 0; i < u8.length; i += chunk) {
+        const slice = u8.subarray(i, i + chunk);
+        out += String.fromCharCode(...slice);
+      }
+      return out;
+    }
+
+    // NOTE: kept for reference; not currently used.
+    function toArrayBuffer(u8) {
+      // Ensure we pass a tight ArrayBuffer slice (some libraries dislike Uint8Array).
+      return u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
+    }
+
+    // ---------- ZIP load ----------
+    $("zipInput").addEventListener("change", async (e) => {
+      try {
+        const file = e.target.files?.[0];
+        if (!file) return;
+
+        setStatus("Reading ZIP…");
+        setMeta("");
+        setProgress01(0);
+        filesCache.clear();
+
+        const ab = await file.arrayBuffer();
+        zipObj = await window.JSZip.loadAsync(ab);
+
+        const mf = zipObj.file("manifest.json");
+        if (!mf) throw new Error("ZIP must contain manifest.json at root");
+
+        manifest = JSON.parse(await mf.async("string"));
+        validateManifest(manifest);
+
+        const targetLabel = normalizeTarget(manifest.target);
+        const name = manifest.project_name || "Firmware";
+        const ver = manifest.project_version ? `v${manifest.project_version}` : "";
+        const gen = manifest.generated_at_utc || "";
+        setMeta(`${name} ${ver} • ${targetLabel} • ${gen}`.trim());
+
+        $("connectBtn").disabled = false;
+        $("flashBtn").disabled = true;
+        $("disconnectBtn").disabled = true;
+
+        setStatus("ZIP loaded. Ready to connect.");
+        log(`Loaded ZIP: ${file.name}`);
+        log(`Project: ${name} ${ver}`.trim());
+        log(`Target: ${manifest.target} (${targetLabel})`);
+        log(`Files: ${manifest.files.length}`);
+        for (const f of manifest.files) {
+          log(`  - ${f.path} @ ${f.offset} (${f.size ?? "?"} bytes) sha256=${f.sha256 ? f.sha256.slice(0,8)+"…" : "?"}`);
+        }
+      } catch (err) {
+        console.error(err);
+        setStatus("Failed to load ZIP.");
+        log(`ERROR: ${err.message || err}`);
+        $("connectBtn").disabled = true;
+        $("flashBtn").disabled = true;
+        $("disconnectBtn").disabled = true;
+        setMeta("");
+      }
+    });
+
+    // ---------- Connect / Disconnect ----------
+    $("connectBtn").addEventListener("click", async () => {
+      try {
+        if (!manifest) throw new Error("Load a ZIP first");
+        setStatus("Requesting serial port…");
+
+        port = await navigator.serial.requestPort({});
+        transport = new Transport(port, true);
+
+        // Choose a baudrate. You can also include it in your manifest later if you want.
+        const baud = 921600;
+
+        setStatus(`Connecting @ ${baud}…`);
+        log(`Connecting @ ${baud}`);
+
+        loader = new ESPLoader({
+          transport,
+          baudrate: baud,
+          terminal: {
+            clean: () => {},
+            writeLine: (s) => log(String(s).trimEnd()),
+            write: (s) => log(String(s).trimEnd())
+          }
+        });
+
+        const chip = await loader.main();
+        log(`Detected: ${chip}`);
+
+        setStatus("Connected.");
+        $("flashBtn").disabled = false;
+        $("disconnectBtn").disabled = false;
+      } catch (err) {
+        console.error(err);
+        setStatus("Connect failed.");
+        log(`ERROR: ${err.message || err}`);
+        await safeDisconnect();
+      }
+    });
+
+    $("disconnectBtn").addEventListener("click", async () => {
+      await safeDisconnect();
+      setStatus("Disconnected.");
+    });
+
+    async function safeDisconnect() {
+      try { if (transport) await transport.disconnect(); } catch {}
+      try { if (port) await port.close(); } catch {}
+      port = null;
+      transport = null;
+      loader = null;
+      $("flashBtn").disabled = true;
+      $("disconnectBtn").disabled = true;
+    }
+
+    function sleep(ms) {
+      return new Promise((r) => setTimeout(r, ms));
+    }
+
+    async function pulseResetViaSerialSignals() {
+      // Best-effort reset using USB-UART control signals.
+      // Typical ESP auto-reset circuits:
+      //   RTS -> EN (reset, active low)
+      //   DTR -> IO0 (boot, active low)
+      // We want: ensure IO0 released, pulse EN low then high.
+      if (!port || !port.setSignals) {
+        log("Reset: port.setSignals not available");
+        return;
+      }
+
+      try {
+        // Release both first
+        await port.setSignals({ dataTerminalReady: false, requestToSend: false });
+        await sleep(50);
+
+        // Pulse EN low (many bridges map RTS asserted -> EN low)
+        await port.setSignals({ dataTerminalReady: false, requestToSend: true });
+        await sleep(120);
+
+        // EN high again
+        await port.setSignals({ dataTerminalReady: false, requestToSend: false });
+        await sleep(120);
+
+        log("Reset pulsed via RTS/DTR.");
+      } catch (e) {
+        log(`Reset pulse failed: ${e?.message || e}`);
+      }
+    }
+
+    // ---------- Flash ----------
+    $("flashBtn").addEventListener("click", async () => {
+      try {
+        if (!loader || !manifest) throw new Error("Not connected or no manifest loaded");
+
+        $("flashBtn").disabled = true;
+        setProgress01(0);
+
+        // Prepare list
+        const entries = manifest.files.map(f => ({
+          path: f.path,
+          offset: parseOffset(f.offset),
+          size: f.size,
+          sha256: f.sha256 ? String(f.sha256).toLowerCase() : null
+        })).sort((a,b) => a.offset - b.offset);
+
+        log("Preparing parts…");
+        setStatus("Loading binaries…");
+
+        // Load all binaries (and optionally verify)
+        const verify = $("verifyHashes").checked;
+        const parts = [];
+        for (let i = 0; i < entries.length; i++) {
+          const e = entries[i];
+          const data = await readZipFileAsUint8(e.path);
+
+          if (e.size !== undefined && data.length !== e.size) {
+            throw new Error(`Size mismatch for ${e.path}: manifest=${e.size}, zip=${data.length}`);
+          }
+
+          if (verify && e.sha256) {
+            setStatus(`Hashing ${e.path}…`);
+            const h = await sha256Hex(data);
+            if (h !== e.sha256) {
+              throw new Error(`SHA-256 mismatch for ${e.path}:\n  manifest=${e.sha256}\n  computed=${h}`);
+            }
+            log(`OK sha256 ${e.path}`);
+          }
+
+          parts.push({ address: e.offset, data, path: e.path });
+          setProgress01((i + 1) / (entries.length * 3)); // rough pre-progress
+        }
+
+        // Flash
+        setStatus("Flashing…");
+        const totalBytes = parts.reduce((s, p) => s + p.data.length, 0);
+
+        for (let i = 0; i < parts.length; i++) {
+          const p = parts[i];
+          log(`Flashing ${p.path} @ 0x${p.address.toString(16)} (${p.data.length} bytes)…`);
+          log(`  data len=${p.data.length} (converted to binary string for esptool-js)`);
+
+          await loader.writeFlash({
+            // IMPORTANT: this esptool-js build expects a "binary string" and will call charCodeAt on it.
+            fileArray: [{ data: u8ToBinaryString(p.data), address: p.address }],
+            flashSize: "keep",
+            flashMode: "keep",
+            flashFreq: "keep",
+            eraseAll: false,
+            // NOTE: this esptool-js build currently only supports compressed writes.
+            // Using compress:false triggers: "Yet to handle Non Compressed writes".
+            compress: true,
+            reportProgress: (written, segTotal) => {
+              const segProgress = segTotal ? (written / segTotal) : 0;
+              const before = parts.slice(0, i).reduce((s, x) => s + x.data.length, 0);
+              const approxGlobal = (before + segProgress * p.data.length) / totalBytes;
+              setProgress01(0.33 + 0.67 * approxGlobal); // after “loading+hashing” phase
+            }
+          });
+        }
+
+        setProgress01(1);
+        setStatus("Flash complete. Resetting…");
+        log("Flash complete.");
+
+        // 1) Try library reset (may be a no-op depending on bridge/browser)
+        try { await loader.hardReset(); } catch {}
+
+        // 2) Best-effort reset via WebSerial control signals
+        await pulseResetViaSerialSignals();
+
+        setStatus("Done.");
+        $("flashBtn").disabled = false;
+      } catch (err) {
+        console.error(err);
+        setStatus("Flash failed.");
+        log(`ERROR: ${err.message || err}`);
+        $("flashBtn").disabled = false;
+      }
+    });
+    log("JS initialized.");
+  </script>
+</body>
+</html>
